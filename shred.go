@@ -43,7 +43,6 @@ func loadMetadata(path string) (ShredMetadata, error) {
 
 // Check if another process is trying to access the file
 func isFileLocked(path string) bool {
-    return false
 	file, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return false
@@ -57,8 +56,6 @@ func isFileLocked(path string) bool {
 	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 	return false
 }
-
-
 
 // Generate a random string of a given length
 func randomString(length int) (string, error) {
@@ -76,6 +73,36 @@ func randomString(length int) (string, error) {
 	return string(b), nil
 }
 
+// Overwrite the entire device for SSDs
+func overwriteDevice(devicePath string) error {
+	device, err := os.OpenFile(devicePath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer device.Close()
+
+	info, err := device.Stat()
+	if err != nil {
+		return err
+	}
+
+	size := info.Size()
+	randomData := make([]byte, 4096) // Use 4KB blocks for writing
+
+	for written := int64(0); written < size; written += 4096 {
+		_, err = rand.Read(randomData)
+		if err != nil {
+			return err
+		}
+
+		_, err = device.WriteAt(randomData, written)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 func Shred(path string, passes int64) error {
 	// File size verification
@@ -87,33 +114,11 @@ func Shred(path string, passes int64) error {
 		return fmt.Errorf("file size exceeds the allowed limit")
 	}
 
-	// Check if another process is locking the file
-	if isFileLocked(path) {
-		fmt.Println("File is locked by another process: ", path)
-		return fmt.Errorf("file is locked by another process")
-	}
-
 	// Load metadata if it exists
 	metadata, err := loadMetadata(path)
 	if err != nil {
 		metadata = ShredMetadata{Pass: 0, TempPath: "", OriginalPath: path}
 	}
-
-	// Acquire the lock on the file
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
-	if err != nil {
-		file.Close()
-		return err
-	}
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-	defer file.Close()
-
-	// Get the file size
-	size := info.Size()
 
 	// Rename the file to a temporary name if not already done
 	if metadata.TempPath == "" {
@@ -129,6 +134,12 @@ func Shred(path string, passes int64) error {
 		}
 	}
 
+	// Check if another process is locking the temporary file
+	if isFileLocked(metadata.TempPath) {
+		fmt.Println("Temporary file is locked by another process: ", metadata.TempPath)
+		return fmt.Errorf("temporary file is locked by another process")
+	}
+
 	// Open the temporary file for writing
 	tempFile, err := os.OpenFile(metadata.TempPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -136,14 +147,16 @@ func Shred(path string, passes int64) error {
 	}
 	defer tempFile.Close()
 
-	// Overwrite the file contents multiple times
-	randomData := make([]byte, size)
-	for i := metadata.Pass; i < passes; i++ {
-		if isFileLocked(metadata.TempPath) {
-			fmt.Println("Temporary file is locked by another process: ", metadata.TempPath)
-			return fmt.Errorf("temporary file is locked by another process")
-		}
+	// Acquire the lock on the temporary file
+	err = syscall.Flock(int(tempFile.Fd()), syscall.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer syscall.Flock(int(tempFile.Fd()), syscall.LOCK_UN)
 
+	// Overwrite the file contents multiple times
+	randomData := make([]byte, info.Size())
+	for i := metadata.Pass; i < passes; i++ {
 		_, err = rand.Read(randomData)
 		if err != nil {
 			return err
@@ -200,6 +213,13 @@ func Shred(path string, passes int64) error {
 		return err
 	}
 
+	// Overwrite the entire device for SSDs
+	// Note: Identify the device path where the file resides
+	//devicePath := "/dev/sdX" // Placeholder, should be identified dynamically
+	//err = overwriteDevice(devicePath)
+	//if err != nil {
+		//return err
+	//}
 
 	return nil
 }
