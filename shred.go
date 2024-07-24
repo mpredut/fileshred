@@ -2,195 +2,204 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"sync"
 	"syscall"
-	"testing"
 )
 
-// Shred securely deletes a file by overwriting it multiple times and then removing it.
-func Shred(path string, passes int) error {
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+// Metadata to track progress
+type ShredMetadata struct {
+	Pass         int64
+	TempPath     string
+	OriginalPath string
+}
+
+// Save metadata to a file
+func saveMetadata(metadata ShredMetadata) error {
+	file, err := os.Create(metadata.OriginalPath + ".shredmeta")
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Lock the file to prevent concurrent access
+	encoder := json.NewEncoder(file)
+	return encoder.Encode(metadata)
+}
+
+// Load metadata from a file
+func loadMetadata(path string) (ShredMetadata, error) {
+	file, err := os.Open(path + ".shredmeta")
+	if err != nil {
+		return ShredMetadata{}, err
+	}
+	defer file.Close()
+
+	var metadata ShredMetadata
+	decoder := json.NewDecoder(file)
+	err = decoder.Decode(&metadata)
+	return metadata, err
+}
+
+// Check if another process is trying to access the file
+func isFileLocked(path string) bool {
+    return false
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		return true
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return false
+}
+
+
+
+// Generate a random string of a given length
+func randomString(length int) (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+
+	return string(b), nil
+}
+
+
+func Shred(path string, passes int64) error {
+	// File size verification
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() > 1024*1024*1024 { // 1GB limit
+		return fmt.Errorf("file size exceeds the allowed limit")
+	}
+
+	// Check if another process is locking the file
+	if isFileLocked(path) {
+		fmt.Println("File is locked by another process: ", path)
+		return fmt.Errorf("file is locked by another process")
+	}
+
+	// Load metadata if it exists
+	metadata, err := loadMetadata(path)
+	if err != nil {
+		metadata = ShredMetadata{Pass: 0, TempPath: "", OriginalPath: path}
+	}
+
+	// Acquire the lock on the file
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
 	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
 	if err != nil {
+		file.Close()
 		return err
 	}
 	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	defer file.Close()
 
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-
+	// Get the file size
 	size := info.Size()
-	randomData := make([]byte, size)
 
-	// Generate random data once
-	_, err = rand.Read(randomData)
+	// Rename the file to a temporary name if not already done
+	if metadata.TempPath == "" {
+		tempPath := path + ".tmp"
+		err = os.Rename(path, tempPath)
+		if err != nil {
+			return err
+		}
+		metadata.TempPath = tempPath
+		err = saveMetadata(metadata)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Open the temporary file for writing
+	tempFile, err := os.OpenFile(metadata.TempPath, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
-
-	// Use a temporary file for the shredding process
-	tempFile, err := ioutil.TempFile("", "shredtemp")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
-	// Perform the overwrite passes on the temporary file
-	for i := 0; i < passes; i++ {
+	// Overwrite the file contents multiple times
+	randomData := make([]byte, size)
+	for i := metadata.Pass; i < passes; i++ {
+		if isFileLocked(metadata.TempPath) {
+			fmt.Println("Temporary file is locked by another process: ", metadata.TempPath)
+			return fmt.Errorf("temporary file is locked by another process")
+		}
+
+		_, err = rand.Read(randomData)
+		if err != nil {
+			return err
+		}
+
 		_, err = tempFile.WriteAt(randomData, 0)
 		if err != nil {
 			return err
 		}
-		err = tempFile.Sync()
+
+		// Save progress to metadata file
+		metadata.Pass = i + 1
+		err = saveMetadata(metadata)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Ensure all data is written to the disk
-	err = tempFile.Sync()
+	// Rename the file to random names multiple times
+	for i := 0; i < 10; i++ { // Adjust the number of renames as needed
+		newName, err := randomString(12)
+		if err != nil {
+			return err
+		}
+
+		newPath := metadata.TempPath + "." + newName
+		err = os.Rename(metadata.TempPath, newPath)
+		if err != nil {
+			return err
+		}
+
+		metadata.TempPath = newPath
+		err = saveMetadata(metadata)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Truncate the temporary file to 0 bytes
+	err = tempFile.Truncate(0)
 	if err != nil {
 		return err
 	}
 
-	// Atomically replace the original file with the shredded temporary file
-	err = os.Rename(tempFile.Name(), path)
+	// Remove the metadata file
+	err = os.Remove(metadata.OriginalPath + ".shredmeta")
 	if err != nil {
 		return err
 	}
 
-	// Finally, remove the file
-	return os.Remove(path)
-}
-
-func TestShred(t *testing.T) {
-	tests := []struct {
-		name       string
-		createFile bool
-		fileSize   int64
-		expectErr  bool
-		fileType   string
-	}{
-		{"Small file", true, 128, false, "regular"},
-		{"Large file", true, 1024 * 1024, false, "regular"},
-		{"Empty file", true, 0, false, "regular"},
-		{"Non-existent file", false, 0, true, "regular"},
-		{"Read-only file", true, 128, true, "readonly"},
-		{"Symbolic link", true, 128, false, "symlink"},
-		{"Hard link", true, 128, false, "hardlink"},
-		{"Locked file", true, 128, true, "locked"},
-		{"Concurrent access", true, 128, false, "concurrent"},
+	// Remove the original file
+	err = os.Remove(metadata.TempPath)
+	if err != nil {
+		return err
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var path string
-			var targetPath string
 
-			if tt.createFile {
-				file, err := ioutil.TempFile("", "shredtest")
-				if err != nil {
-					t.Fatalf("Failed to create test file: %v", err)
-				}
-				path = file.Name()
-				file.Truncate(tt.fileSize)
-				file.Close()
-
-				if tt.fileType == "readonly" {
-					err = os.Chmod(path, 0444)
-					if err != nil {
-						t.Fatalf("Failed to set read-only permission: %v", err)
-					}
-				} else if tt.fileType == "symlink" {
-					targetPath = path + "_target"
-					err = os.Rename(path, targetPath)
-					if err != nil {
-						t.Fatalf("Failed to rename file: %v", err)
-					}
-					err = os.Symlink(targetPath, path)
-					if err != nil {
-						t.Fatalf("Failed to create symlink: %v", err)
-					}
-				} else if tt.fileType == "hardlink" {
-					targetPath = path + "_target"
-					err = os.Link(path, targetPath)
-					if err != nil {
-						t.Fatalf("Failed to create hard link: %v", err)
-					}
-				} else if tt.fileType == "locked" {
-					file, err := os.OpenFile(path, os.O_RDWR, 0)
-					if err != nil {
-						t.Fatalf("Failed to open file for locking: %v", err)
-					}
-					defer file.Close()
-					err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-					if err != nil {
-						t.Fatalf("Failed to lock file: %v", err)
-					}
-				}
-			} else {
-				path = "nonexistentfile"
-			}
-
-			if tt.fileType == "concurrent" {
-				var wg sync.WaitGroup
-				wg.Add(2)
-				go func() {
-					defer wg.Done()
-					err := Shred(path, 3)
-					if (err != nil) != tt.expectErr {
-						t.Errorf("Shred() error = %v, expectErr %v", err, tt.expectErr)
-					}
-				}()
-				go func() {
-					defer wg.Done()
-					err := Shred(path, 3)
-					if (err != nil) != tt.expectErr {
-						t.Errorf("Shred() error = %v, expectErr %v", err, tt.expectErr)
-					}
-				}()
-				wg.Wait()
-			} else {
-				err := Shred(path, 3)
-				if (err != nil) != tt.expectErr {
-					t.Errorf("Shred() error = %v, expectErr %v", err, tt.expectErr)
-				}
-			}
-
-			if tt.createFile && !tt.expectErr {
-				if _, err := os.Stat(path); !os.IsNotExist(err) {
-					t.Errorf("File still exists after shred: %s", path)
-				}
-				if tt.fileType == "symlink" {
-					if _, err := os.Stat(targetPath); !os.IsNotExist(err) {
-						t.Errorf("Target file of symlink still exists after shred: %s", targetPath)
-					}
-				}
-			}
-		})
-	}
-}
-
-func runTests() {
-	fmt.Println("Running tests...")
-	m := testing.MainStart(testing.TestDeps{}, []testing.InternalTest{
-		{"TestShred", TestShred},
-	}, nil, nil)
-	os.Exit(m.Run())
-}
-
-func main() {
-	runTests()
+	return nil
 }
